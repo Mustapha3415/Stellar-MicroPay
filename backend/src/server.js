@@ -8,9 +8,18 @@
 const express = require("express");
 const cors = require("cors");
 const helmet = require("helmet");
-const morgan = require("morgan");
+const pinoHttp = require("pino-http");
+const crypto = require("node:crypto");
 const rateLimit = require("express-rate-limit");
 require("dotenv").config();
+const { csrfProtection } = require("./middleware/csrf");
+
+// ─── Env Validation ───────────────────────────────────────────────────────────
+// Must run immediately after dotenv so missing vars are caught before any
+// service or route module tries to use them.
+const { validateEnv, loadSecrets } = require("./config/validateEnv");
+loadSecrets();
+validateEnv();
 
 const accountRoutes = require("./routes/accounts");
 const authRoutes = require("./routes/auth");
@@ -20,17 +29,42 @@ const healthRoutes = require("./routes/health");
 const federationRoutes = require("./routes/federation");
 const turretsRoutes = require("./routes/turrets");
 const tipsRoutes = require("./routes/tips");
+const pushRoutes = require("./routes/push");
+const webhooksRoutes = require("./routes/webhooks");
+const requestId = require("./middleware/requestId");
 const swaggerUi = require("swagger-ui-express");
 const swaggerSpec = require("./swagger");
 const { startTurretsServer } = require("./turretsServer");
+const logger = require("./logger");
+const { sanitizeRequest } = require("./middleware/sanitization");
 
 const app = express();
 const PORT = process.env.PORT || 4000;
 
-// ─── Middleware ───────────────────────────────────────────────────────────────
+/**
+ * Attach a correlation id to every request: echo the caller's X-Request-ID
+ * when supplied, otherwise generate one. The id is echoed back on the
+ * response and available to pino-http and the error handler.
+ */
+function requestId(req, res, next) {
+  const supplied = req.headers["x-request-id"];
+  req.requestId =
+    typeof supplied === "string" && supplied.trim()
+      ? supplied.trim()
+      : crypto.randomUUID();
+  res.setHeader("X-Request-ID", req.requestId);
+  next();
+}
+// ─── Middleware ─────────────────────────────────────────────────────────────────
 
+app.use(requestId);
 app.use(helmet());
-app.use(morgan("dev"));
+app.use(
+  pinoHttp({
+    logger,
+    customProps: (req) => ({ requestId: req.requestId }),
+  }),
+);
 app.use(express.json({ limit: "10kb" }));
 
 // JSON parsing error handler
@@ -38,8 +72,14 @@ app.use((err, req, res, next) => {
   if (err instanceof SyntaxError && err.status === 400 && "body" in err) {
     return res.status(400).json({ error: "Invalid JSON body" });
   }
-  next();
+  // Forward other body-parser errors (e.g. 413 payload too large) so they are
+  // not silently swallowed and the request does not reach the route handlers.
+  next(err);
 });
+
+// Global input sanitization — trims strings and rejects null bytes on every
+// route. Must be mounted before the route handlers below.
+app.use(sanitizeRequest);
 
 // CORS
 const allowedOrigins = (process.env.ALLOWED_ORIGINS || "http://localhost:3000")
@@ -56,18 +96,29 @@ app.use(
         callback(new Error(`CORS: origin ${origin} not allowed`));
       }
     },
-    methods: ["GET", "POST"],
-    allowedHeaders: ["Content-Type", "Authorization"],
+    methods: ["GET", "POST", "DELETE"],
+    allowedHeaders: [
+      "Content-Type",
+      "Authorization",
+      "X-Request-ID",
+      "X-Idempotency-Key",
+    ],
+    exposedHeaders: ["X-Request-ID", "X-Idempotency-Replayed"],
     credentials: true,
-  })
+    optionsSuccessStatus: 204,
+    maxAge: 600,
+  }),
 );
 
-// ─── Routes ───────────────────────────────────────────────────────────────────
-
-app.use("/api/auth",     authRoutes);
-app.use("/api/accounts", accountRoutes);
-app.use("/api/payments", paymentRoutes);
-app.use("/health",       healthRoutes);
+// ─── CSRF Protection ────────────────────────────────────────────────────────
+// Double-submit cookie verification for state-changing requests. The SEP-0010
+// auth endpoints bootstrap the token/session and must stay reachable without
+// one, so they are exempt. See src/middleware/csrf.js and the analysis in
+// src/middleware/auth.js.
+app.use((req, res, next) => {
+  if (req.path.startsWith("/api/auth")) return next();
+  return csrfProtection(req, res, next);
+});
 
 // Global rate limiting — 100 requests per 15 minutes per IP
 const limiter = rateLimit({
@@ -81,21 +132,40 @@ app.use(limiter);
 
 // ─── Routes ──────────────────────────────────────────────────────────────────
 
+app.use("/api/auth", authRoutes);
 app.use("/api/accounts", accountRoutes);
 app.use("/api/payments", paymentRoutes);
+app.use("/health", healthRoutes);
 app.use("/api/analytics", analyticsRoutes);
 app.use("/api/health", healthRoutes);
 app.use("/api/turrets", turretsRoutes);
 app.use("/api/tips", tipsRoutes);
+app.use("/api/contacts", contactsRoutes);
+app.use("/api/webhooks", webhooksRoutes);
+app.use("/api/network", networkRoutes);
+app.use("/api/price-alerts", priceAlertsRoutes);
 app.use("/federation", federationRoutes);
 
 // ─── API Documentation ─────────────────────────────────────────────────────────
 
-app.use("/api/docs", swaggerUi.serve, swaggerUi.setup(swaggerSpec, {
-  customSiteTitle: "Stellar MicroPay API Docs",
-  customCss: ".swagger-ui .topbar { display: none }",
-  swaggerOptions: { url: "/api/docs.json" },
-}));
+if (process.env.METRICS_ENABLED === "true") {
+  const client = require("prom-client");
+  client.collectDefaultMetrics();
+  app.get("/metrics", (req, res) => {
+    res.set("Content-Type", client.register.contentType);
+    res.end(client.register.metrics());
+  });
+}
+
+app.use(
+  "/api/docs",
+  swaggerUi.serve,
+  swaggerUi.setup(swaggerSpec, {
+    customSiteTitle: "Stellar MicroPay API Docs",
+    customCss: ".swagger-ui .topbar { display: none }",
+    swaggerOptions: { url: "/api/docs.json" },
+  }),
+);
 
 app.get("/api/docs.json", (req, res) => {
   res.setHeader("Content-Type", "application/json");
@@ -108,6 +178,8 @@ app.use((err, req, res, next) => {
   void next;
   const status = err.status || 500;
   const message = err.message || "Internal Server Error";
+
+  req.log.error({ err, requestId: req.requestId, status }, "Request failed");
 
   res.status(status).json({ error: message });
 });
@@ -127,8 +199,13 @@ SERVER = "https://${domain}/federation"
 // ─── Start ────────────────────────────────────────────────────────────────────
 
 if (require.main === module) {
-  app.listen(PORT, () => {
-    console.log(`
+  // Refuse to start on an insecure configuration rather than serving traffic
+  // with a publicly-known signing key.
+  loadSecrets();
+  validateEnv();
+
+  const server = app.listen(PORT, () => {
+    logger.info(`
   ✨ Stellar MicroPay API
   🚀 Server running at http://localhost:${PORT}
   🌐 Network: ${process.env.STELLAR_NETWORK || "testnet"}
@@ -136,6 +213,18 @@ if (require.main === module) {
   });
 
   startTurretsServer();
+
+  const shutdown = () => {
+    logger.info("Shutting down... clearing timers.");
+    const { stopRunner } = require("./services/turretsService");
+    stopRunner();
+    server.close(() => {
+      process.exit(0);
+    });
+  };
+
+  process.on("SIGTERM", shutdown);
+  process.on("SIGINT", shutdown);
 }
 
 module.exports = app;
